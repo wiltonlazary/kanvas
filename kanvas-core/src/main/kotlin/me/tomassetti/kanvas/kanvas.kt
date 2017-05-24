@@ -1,19 +1,22 @@
 package me.tomassetti.kanvas
 
+import me.tomassetti.kolasu.model.Node
 import org.fife.ui.autocomplete.*
 import org.fife.ui.rsyntaxtextarea.RSyntaxDocument
 import org.fife.ui.rsyntaxtextarea.RSyntaxTextArea
 import org.fife.ui.rsyntaxtextarea.parser.*
 import org.fife.ui.rtextarea.RTextScrollPane
-import java.awt.*
 import java.io.File
+import java.awt.*
 import java.net.URL
 import java.nio.charset.Charset
 import java.util.*
 import javax.swing.*
 import javax.swing.plaf.metal.MetalTabbedPaneUI
-import javax.swing.plaf.synth.SynthScrollBarUI
-import javax.swing.text.*
+import javax.swing.text.BadLocationException
+import javax.swing.text.Document
+import javax.swing.text.JTextComponent
+import javax.swing.text.Segment
 
 private val BACKGROUND = Color(39, 40, 34)
 private val BACKGROUND_SUBTLE_HIGHLIGHT = Color(49, 50, 44)
@@ -21,6 +24,14 @@ private val BACKGROUND_DARKER = Color(23, 24, 20)
 private val BACKGROUND_LIGHTER = Color(109, 109, 109)
 
 class TextPanel(textArea: RSyntaxTextArea, var file : File?) : RTextScrollPane(textArea) {
+    private var cachedRootField : Node?= null
+
+    var cachedRoot : Node?
+        get() = cachedRootField
+        set(value) {
+            cachedRootField = value
+        }
+
     val text : String
         get() = textArea.text
     var title : String
@@ -34,16 +45,27 @@ class TextPanel(textArea: RSyntaxTextArea, var file : File?) : RTextScrollPane(t
         tabbedPane().removeTabAt(index())
     }
 
-    fun  changeLanguageSupport(languageSupport: LanguageSupport) {
+    fun changeLanguageSupport(languageSupport: LanguageSupport<*>) {
         (textArea.document as RSyntaxDocument).setSyntaxStyle(AntlrTokenMaker(languageSupport.antlrLexerFactory))
         (textArea as RSyntaxTextArea).syntaxScheme = languageSupport.syntaxScheme
     }
+
+    val code : String
+        get() = textArea.document.getText(0, textArea.document.length)
+
+    fun setFontSize(fontSize: Float) {
+       super.setFont(super.getFont().deriveFont(fontSize))
+       textArea.font = textArea.font.deriveFont(fontSize)
+    }
+
 }
 
-private fun makeTextPanel(font: Font, languageSupport: LanguageSupport, initialContenxt: String = "", file: File? = null) : TextPanel {
+private fun <RootNode:Node> makeTextPanel(font: Font, languageSupport: LanguageSupport<RootNode>, initialContenxt: String = "", file: File? = null) : TextPanel {
     val textArea = RSyntaxTextArea(20, 60)
 
     (textArea.document as RSyntaxDocument).setSyntaxStyle(AntlrTokenMaker(languageSupport.antlrLexerFactory))
+
+    val context = languageSupport.contextCreator.create()
 
     textArea.syntaxScheme = languageSupport.syntaxScheme
     textArea.text = initialContenxt
@@ -52,37 +74,45 @@ private fun makeTextPanel(font: Font, languageSupport: LanguageSupport, initialC
     textArea.background = BACKGROUND
     textArea.foreground = Color.WHITE
     textArea.currentLineHighlightColor = BACKGROUND_SUBTLE_HIGHLIGHT
+    val textPanel = TextPanel(textArea, file)
     textArea.addParser(object : Parser {
 
         override fun getHyperlinkListener(): ExtendedHyperlinkListener {
             throw UnsupportedOperationException("not implemented") //To change body of created functions use File | Settings | File Templates.
         }
 
-        override fun getImageBase(): URL {
-            throw UnsupportedOperationException("not implemented") //To change body of created functions use File | Settings | File Templates.
+        override fun getImageBase(): URL? {
+            return null
         }
 
         override fun parse(doc: RSyntaxDocument, style: String): ParseResult {
-            val issues = languageSupport.validator.validate(doc.getText(0, doc.length))
-            val parseResult =  DefaultParseResult(this)
-            issues.forEach { parseResult.addNotice(DefaultParserNotice(this, it.message, it.line, it.offset, it.length)) }
-            return parseResult
+            val kolasuParseResult = languageSupport.parser.parse(doc.getText(0, doc.length))
+            if (kolasuParseResult.root != null) {
+                textPanel.cachedRoot = kolasuParseResult.root
+            }
+            val issues = languageSupport.validator.validate(kolasuParseResult, context)
+            val kanvasParseResult =  DefaultParseResult(this)
+            issues.forEach { kanvasParseResult.addNotice(DefaultParserNotice(this, it.message, it.line, it.offset, it.length)) }
+            return kanvasParseResult
         }
 
         override fun isEnabled(): Boolean = true
     })
-    val textPanel = TextPanel(textArea, file)
 
-    val provider = createCompletionProvider(languageSupport)
+    val provider = createCompletionProvider(languageSupport, context, textPanel)
     val ac = AutoCompletion(provider)
     ac.install(textArea)
 
     textPanel.viewportBorder = BorderFactory.createEmptyBorder()
-    textPanel.verticalScrollBar.ui = object : SynthScrollBarUI() {
-        override fun configureScrollBarColors() {
-            super.configureScrollBarColors()
-        }
-    }
+//    try {
+//        textPanel.verticalScrollBar.ui = object : SynthScrollBarUI() {
+//            override fun configureScrollBarColors() {
+//                super.configureScrollBarColors()
+//            }
+//        }
+//    } catch (e: Exception) {
+//        System.err.println(e.message)
+//    }
     return textPanel
 }
 
@@ -129,7 +159,10 @@ private abstract class AbstractCompletionProviderBase : CompletionProviderBase()
     }
 }
 
-fun createCompletionProvider(languageSupport: LanguageSupport): CompletionProvider {
+fun LanguageSupport<*>.autoCompletionSuggester() = AutoCompletionContextProvider(this.parserData!!.ruleNames,
+        this.parserData!!.vocabulary, this.parserData!!.atn)
+
+fun createCompletionProvider(languageSupport: LanguageSupport<*>, context: Context, textPanel: TextPanel): CompletionProvider {
     if (languageSupport.parserData == null) {
         return object : AbstractCompletionProviderBase() {
 
@@ -140,9 +173,19 @@ fun createCompletionProvider(languageSupport: LanguageSupport): CompletionProvid
         }
     }
     val cp = object : AbstractCompletionProviderBase() {
+        val thisACPB = this
 
-        private val autoCompletionSuggester = AntlrAutoCompletionSuggester(languageSupport.parserData!!.ruleNames,
-                languageSupport.parserData!!.vocabulary, languageSupport.parserData!!.atn)
+        private val autoCompletionSuggester = languageSupport.autoCompletionSuggester()
+
+        private fun pointInCode(comp: JTextComponent) : me.tomassetti.kolasu.model.Point {
+            val doc = comp.document
+            val dot = comp.caretPosition
+            val root = doc.defaultRootElement
+            val currLineIndex = root.getElementIndex(dot)
+            val currentLine = root.getElement(currLineIndex)
+            val startLine = currentLine.startOffset
+            return me.tomassetti.kolasu.model.Point(currLineIndex, dot - startLine)
+        }
 
         private fun beforeCaret(comp: JTextComponent) : String {
             val doc = comp.document
@@ -173,10 +216,18 @@ fun createCompletionProvider(languageSupport: LanguageSupport): CompletionProvid
         override fun getCompletionsImpl(comp: JTextComponent): MutableList<Completion>? {
             val retVal = ArrayList<Completion>()
             val code = beforeCaret(comp)
-            val autoCompletionContext = autoCompletionSuggester.suggestions(EditorContextImpl(code, languageSupport.antlrLexerFactory))
+            val autoCompletionContext = autoCompletionSuggester.autoCompletionContext(
+                    EditorContextImpl(code, languageSupport.antlrLexerFactory, textPanel))
             autoCompletionContext.proposals.forEach {
-                if (it.type != -1) {
-                    retVal.addAll(languageSupport.propositionProvider.fromTokenType(this, autoCompletionContext.preecedingTokens, it.type))
+                if (it.first.type != -1) {
+                    retVal.addAll(languageSupport.propositionProvider.fromTokenType(
+                            AutocompletionSurroundingInformation(
+                                    textPanel.cachedRoot,
+                                    autoCompletionContext.preecedingTokens,
+                                    it.second.rulesStack(),
+                                    pointInCode(comp)), it.first.type, context).map {
+                        BasicCompletion(thisACPB, it)
+                    })
                 }
             }
 
@@ -219,7 +270,6 @@ class MyTabbedPane : JTabbedPane() {
 
 }
 
-
 //
 // Commands
 //
@@ -229,7 +279,7 @@ private fun saveAsCommand(tabbedPane : MyTabbedPane) {
         return
     }
     val fc = JFileChooser()
-    val res = fc.showOpenDialog(tabbedPane)
+    val res = fc.showSaveDialog(tabbedPane)
     if (res == JFileChooser.APPROVE_OPTION) {
         (tabbedPane.selectedComponent as TextPanel).file = fc.selectedFile
         val languageSupport = languageSupportRegistry.languageSupportForFile(fc.selectedFile)
@@ -262,17 +312,24 @@ private fun closeCommand(tabbedPane : MyTabbedPane) {
 // Public API
 //
 
-class Kanvas {
+open class Kanvas {
 
     val APP_TITLE = "Kanvas"
+    val DEFAULT_FONT_SIZE = 24.0f
 
     val defaultFont: Font = Font.createFont(Font.TRUETYPE_FONT, Object().javaClass.getResourceAsStream("/CutiveMono-Regular.ttf"))
-            .deriveFont(24.0f)
+            .deriveFont(DEFAULT_FONT_SIZE)
 
     private val tabbedPane = MyTabbedPane()
 
+    var fontSize : Float = DEFAULT_FONT_SIZE
+        set(value) {
+            field = value
+            currentTab?.setFontSize(value)
+        }
+
     fun addTab(title: String, font: Font = defaultFont, initialContenxt: String = "",
-                       languageSupport: LanguageSupport = noneLanguageSupport,
+                       languageSupport: LanguageSupport<*> = noneLanguageSupport,
                        file: File? = null) {
         try {
             val panel = makeTextPanel(font, languageSupport, initialContenxt, file)
@@ -280,10 +337,16 @@ class Kanvas {
             tabbedPane.setForegroundAt(tabbedPane.tabCount - 1, Color.white)
             tabbedPane.setBackgroundAt(tabbedPane.tabCount - 1, BACKGROUND_DARKER)
         } catch (e : Exception) {
-            JOptionPane.showMessageDialog(tabbedPane, "Error creating tab for language ${languageSupport}: ${e.message}")
+            JOptionPane.showMessageDialog(tabbedPane, "Error creating tab for language $languageSupport: ${e.message}")
             e.printStackTrace()
         }
     }
+
+    private val currentTab : TextPanel?
+        get() = tabbedPane.selectedComponent as TextPanel
+
+    val currentCode : String?
+        get() = this.currentTab?.code
 
     private fun openCommand() {
         val fc = JFileChooser()
@@ -302,23 +365,7 @@ class Kanvas {
         return img
     }
 
-    fun createAndShowKanvasGUI() {
-        UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())
-
-        val xToolkit = Toolkit.getDefaultToolkit()
-        val awtAppClassNameField = xToolkit.javaClass.getDeclaredField("awtAppClassName")
-        awtAppClassNameField.isAccessible = true
-        awtAppClassNameField.set(xToolkit, APP_TITLE)
-
-        val frame = JFrame(APP_TITLE)
-        frame.iconImage = createKanvasIcon()
-        frame.background = BACKGROUND_DARKER
-        frame.contentPane.background = BACKGROUND_DARKER
-        frame.defaultCloseOperation = JFrame.EXIT_ON_CLOSE
-
-        frame.contentPane.add(tabbedPane)
-
-        val menuBar = JMenuBar()
+    open protected fun populateMenu(menuBar : JMenuBar) {
         val fileMenu = JMenu("File")
         menuBar.add(fileMenu)
         val open = JMenuItem("Open")
@@ -336,6 +383,32 @@ class Kanvas {
         val close = JMenuItem("Close")
         close.addActionListener { closeCommand(tabbedPane) }
         fileMenu.add(close)
+    }
+
+    fun createAndShowKanvasGUI() {
+        UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())
+
+        try {
+            val xToolkit = Toolkit.getDefaultToolkit()
+            println("XTOOLKIT "+xToolkit)
+            val awtAppClassNameField = xToolkit.javaClass.getDeclaredField("awtAppClassName")
+            awtAppClassNameField.isAccessible = true
+            awtAppClassNameField.set(xToolkit, APP_TITLE)
+        } catch (e: Exception) {
+            // ignore
+            System.err.println(e.message)
+        }
+
+        val frame = JFrame(APP_TITLE)
+        frame.iconImage = createKanvasIcon()
+        frame.background = BACKGROUND_DARKER
+        frame.contentPane.background = BACKGROUND_DARKER
+        frame.defaultCloseOperation = JFrame.EXIT_ON_CLOSE
+
+        frame.contentPane.add(tabbedPane)
+
+        val menuBar = JMenuBar()
+        populateMenu(menuBar)
         frame.jMenuBar = menuBar
 
         frame.pack()

@@ -7,3 +7,5 @@ out
 *.ipr
 *.iws
 lib
+release
+**/.DS_Store
